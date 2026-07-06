@@ -1,0 +1,13 @@
+.git
+**/__pycache__
+**/*.pyc
+# Workshop runtime data (logs, trials, HF cache, extracted tasks) must never
+# enter the build context — it can be huge and is regenerated/baked at build.
+examples/experimental/qwen3-codecontests/runtime
+examples/experimental/qwen3-codecontests/data/cc_train_*.jsonl
+**/.ipynb_checkpoints
+*.egg-info
+.venv
+# The legacy multi-container DinD notebook must not ship in the single-image
+# proot build — only run_from_scratch_single.ipynb is the supported entrypoint.
+examples/experimental/qwen3-codecontests/run_from_scratch.ipynb

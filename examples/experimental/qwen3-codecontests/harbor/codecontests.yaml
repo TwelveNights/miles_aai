@@ -59,9 +59,15 @@ agent:
     3. **At least one bash tool call** to execute your planned command(s).
 
     Execution notes:
-    - The system runs each command in a FRESH subshell and returns the result;
-      directory/env changes do NOT persist across commands. Prefix with
-      `cd /app && ...` or write/load env from files as needed.
+    - Each command runs in a FRESH subshell, so shell state (the current
+      directory, shell variables) does NOT carry over between commands. Use
+      absolute paths like `/app/solution.py`.
+    - FILES DO persist between commands. Once you write `/app/solution.py` it
+      stays on disk for every later command (and for grading) until you
+      overwrite it — you do NOT need to recreate it each turn.
+    - Order matters: WRITE `/app/solution.py` first, and only THEN run
+      `python3 /app/solution.py`. Running it before the file exists fails with
+      "can't open file '/app/solution.py'".
     - Prefer small, verifiable steps so you can iterate on each result.
 
     ## Recommended workflow
@@ -73,6 +79,8 @@ agent:
     5. Submit (see below).
 
     ## Creating /app/solution.py
+    ALWAYS write the file with a heredoc so real newlines and indentation are
+    preserved, and ALWAYS redirect to the file with `> /app/solution.py`:
     ```bash
     mkdir -p /app && cat <<'EOF' > /app/solution.py
     import sys
@@ -83,6 +91,10 @@ agent:
         main()
     EOF
     ```
+    Do NOT write the program with a single-line `echo 'import sys def main(): ...'`
+    — collapsing Python onto one line is a syntax error, and `echo` without a
+    `> /app/solution.py` redirect only prints to the screen without creating the
+    file. After writing, confirm it exists with `cat /app/solution.py`.
 
     ## Testing against the sample
     ```bash

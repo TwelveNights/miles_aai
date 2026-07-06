@@ -25,6 +25,22 @@ _release-raw:
         docker push radixark/miles:latest
     fi
 
+# Single-image, Docker-free qwen3-codecontests workshop (harbor + miles +
+# jupyter in one image; Harbor grades via the proot subprocess env). Build
+# context = repo root (the Dockerfile COPYs the miles source + workshop).
+#   just workshop                  # build miles_workshop:v1
+#   IMAGE_TAG=v2 just workshop      # custom tag
+workshop:
+    #!/bin/bash
+    set -euxo pipefail
+    cd ..
+    IMAGE_TAG="${IMAGE_TAG:-v1}"
+    docker build -f docker/Dockerfile.workshop \
+        --build-arg HTTP_PROXY="${http_proxy:-}" \
+        --build-arg HTTPS_PROXY="${https_proxy:-}" \
+        --build-arg NO_PROXY="localhost,127.0.0.1" \
+        -t "miles_workshop:${IMAGE_TAG}" .
+
 debug:
     #!/bin/bash
     set -euxo pipefail

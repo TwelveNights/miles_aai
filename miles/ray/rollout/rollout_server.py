@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import logging
+import os
 
 import ray
 
@@ -114,11 +115,27 @@ def _resolve_sglang_config(args) -> SglangConfig:
     if args.prefill_num_servers is not None:
         return SglangConfig.from_prefill_num_servers(args)
 
+    # Optional cap on the largest CUDA-graph batch size captured at startup.
+    # SGLang otherwise captures graphs up to bs=512 (~50 sizes, ~70s on MI300),
+    # most of which never run when concurrency is low. Setting this env to the
+    # peak concurrency (rollout_batch_size * n_samples_per_prompt) collapses
+    # capture to a few seconds. Unset -> SGLang's default auto-sizing (unchanged).
+    overrides: dict = {}
+    _cg_max_bs = os.environ.get("MILES_CUDA_GRAPH_MAX_BS")
+    if _cg_max_bs:
+        overrides["cuda_graph_max_bs"] = int(_cg_max_bs)
+
     return SglangConfig(
         models=[
             ModelConfig(
                 name="default",
-                server_groups=[ServerGroupConfig(worker_type="regular", num_gpus=args.rollout_num_gpus)],
+                server_groups=[
+                    ServerGroupConfig(
+                        worker_type="regular",
+                        num_gpus=args.rollout_num_gpus,
+                        overrides=overrides,
+                    )
+                ],
             )
         ]
     )

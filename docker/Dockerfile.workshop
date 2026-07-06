@@ -1,0 +1,223 @@
+# Single-image, Docker-free qwen3-codecontests workshop.
+#
+# Consolidates the three workshop containers (miles_swe trainer + agent_env
+# Harbor + cc_notebook JupyterLab) into ONE image and removes Docker-in-Docker:
+# Harbor grades each task on the bare host inside a proot sandbox via the
+# `subprocess` environment (no per-task containers, no docker socket, no
+# swe-net). All inter-service comms collapse to localhost.
+#
+# Build context = repo root (it COPYs miles source + the workshop dir):
+#   docker build -f docker/Dockerfile.workshop -t miles_workshop:v1 .
+# Run (GPU host):
+#   bash docker/run_workshop.sh
+#
+# Inherits the rlsys ROCm/SGLang/Megatron base (same as Dockerfile.cc-base), so
+# this image is MI300/ROCm-specific and large (~75GB base). Other accelerators
+# should adapt from the existing per-arch Dockerfiles.
+FROM rlsys/miles:rocm7-MI300-sglang0.5.9-latest
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1
+
+# --------------------------------------------------------------------------- #
+# 1. SGLang TITO patches (identical to Dockerfile.cc-base).
+# --------------------------------------------------------------------------- #
+COPY docker/cc_patch/sglang_tito.patch /tmp/sglang_tito.patch
+RUN cd /app/sglang \
+    && git apply -p1 /tmp/sglang_tito.patch \
+    && grep -q "return_meta_info" python/sglang/srt/entrypoints/openai/protocol.py \
+    && grep -q "input_ids: Optional" python/sglang/srt/entrypoints/openai/protocol.py \
+    && grep -q "meta_info=choice_meta_info" python/sglang/srt/entrypoints/openai/serving_chat.py \
+    && grep -q "batch_decode(\[\[tid\]" python/sglang/srt/managers/tokenizer_manager.py \
+    && echo "TITO patch applied + verified" \
+    && rm -f /tmp/sglang_tito.patch
+RUN find /app/sglang -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+
+# --------------------------------------------------------------------------- #
+# 2. Miles runtime deps not carried by the rlsys base (identical to cc-base).
+#    torch-linked packages use --no-deps so pip can't pull a non-ROCm torch.
+# --------------------------------------------------------------------------- #
+RUN pip install --no-cache-dir \
+        wandb \
+        omegaconf \
+        memray \
+        "mcp[cli]" \
+        qwen_vl_utils \
+        polars \
+        pylatexenc \
+        opentelemetry-exporter-otlp-proto-http \
+    && pip install --no-cache-dir --no-deps \
+        ring_flash_attn \
+        "torchft-nightly==2026.4.3"
+
+# --------------------------------------------------------------------------- #
+# 3. Bare-host grading toolchain (replaces Docker-in-Docker task sandboxes).
+#    - proot: the subprocess env's sandbox (userspace, ptrace-based path
+#      binding). Needs no namespaces/capabilities, so grading runs in a fully
+#      NON-privileged Kubernetes pod (RuntimeDefault seccomp) -- the right fit
+#      for untrusted task code where the pod is the security boundary.
+#    - curl/jq/git: used by the per-task tests/test.sh bootstrap.
+#    The dataset test.sh still curls uv + `uv add`s pytest at runtime (egress
+#    assumed); we also bake uv + pytest + the json-ctrf plugin so the original
+#    `pytest --ctrf` grading path resolves immediately on the default python.
+#    The ctrf plugin's import module is `ctrf` (entry point "ctrf").
+# --------------------------------------------------------------------------- #
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        proot \
+        curl \
+        jq \
+        git \
+        build-essential \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && proot --version | head -1
+# No-op apt-get shim. The consolidated single-host model runs many agents at once
+# (--max-concurrent), and the mini-swe-agent setup + dataset test.sh both call
+# `apt-get update && install` on the SHARED host. apt's lists lock has NO native
+# timeout, so concurrent calls collide -> "Could not get lock" (exit 100) ->
+# agent setup fails -> every trial AgentError -> all rewards 0. Serializing with
+# flock just deadlocks the queue. Since curl/git/build-essential are already baked
+# above, the right fix is to make update/install/upgrade no-op successes; any
+# other apt-get subcommand still falls through to the real binary.
+RUN mv /usr/bin/apt-get /usr/bin/apt-get.real \
+    && printf '%s\n' \
+        '#!/bin/bash' \
+        '# baked image: build tools already present; avoid concurrent apt lock collisions' \
+        'case "$1" in' \
+        '  update|install|upgrade|"") exit 0 ;;' \
+        '  *) exec /usr/bin/apt-get.real "$@" ;;' \
+        'esac' \
+        > /usr/bin/apt-get \
+    && chmod +x /usr/bin/apt-get
+RUN curl -LsSf https://astral.sh/uv/0.7.13/install.sh | sh \
+    && ln -sf /root/.local/bin/uv /usr/local/bin/uv \
+    && uv --version
+RUN pip install --no-cache-dir \
+        "pytest==8.4.1" \
+        "pytest-json-ctrf==0.3.5" \
+    && python -c "import pytest, ctrf; print('pytest + ctrf ok')"
+
+# --------------------------------------------------------------------------- #
+# 4. Harbor (with the subprocess environment) + the mini-swe-agent runner.
+#    Harbor requires Python >=3.12 but the rlsys base is Python 3.10 (and the
+#    whole miles/torch/SGLang stack is bound to it), so harbor CANNOT share the
+#    base interpreter. Install it into an isolated uv-managed 3.12 venv; the
+#    harbor server runs with that interpreter (HARBOR_PYTHON) while training
+#    keeps using the base python3. The two roles are separate processes that
+#    only talk over HTTP (localhost:11000), so they never share a Python.
+#    Pulled from the fork branch until the subprocess env lands upstream.
+# --------------------------------------------------------------------------- #
+ARG HARBOR_REF=git+https://github.com/TwelveNights/harbor.git@feat/subprocess-environment
+ENV HARBOR_VENV=/opt/harbor-venv
+ENV HARBOR_PYTHON=${HARBOR_VENV}/bin/python
+RUN uv python install 3.12 \
+    && uv venv --python 3.12 "${HARBOR_VENV}" \
+    && VIRTUAL_ENV="${HARBOR_VENV}" uv pip install --python "${HARBOR_PYTHON}" \
+        "harbor @ ${HARBOR_REF}" \
+        mini-swe-agent==2.3.0 \
+    && "${HARBOR_PYTHON}" -c "from harbor.environments.subprocess import SubprocessEnvironment; print('harbor subprocess env ok')"
+
+# --------------------------------------------------------------------------- #
+# 4b. Prebuilt aiter kernels (gfx942 / MI300).
+#     aiter compiles ROCm kernels (rmsnorm_quant, mha_batch_prefill, pa_ragged,
+#     ...) on first model use, guarded by a FileBaton lock with no timeout. That
+#     adds ~45-60s to the FIRST SGLang init in every fresh pod AND risks a
+#     permanent hang if a run is killed mid-compile (orphaned lock -> next run
+#     waits forever). Bake the compiled .so so nothing compiles at runtime:
+#     first-run init drops from ~100s to ~25s and the lock-hang becomes
+#     impossible. aiter trusts an existing .so by path (no source re-hash).
+#
+#     There are TWO aiter cache trees, both required:
+#       (1) /app/aiter/aiter/jit  — JIT modules. Reuse fast-path imports the
+#           top-level <module>.so (= get_user_jit_dir()), NOT the
+#           build/<module>/build/<module>.so output tree, so BOTH must be present.
+#       (2) /root/.aiter          — the cpp_itfs AOT cache (pa_ragged paged-attn).
+#           HOME-based; keyed by a deterministic source hash.
+#
+#     COUPLING: these .so are gfx942-specific and built against THIS base image's
+#     aiter + ROCm + sglang. They are only valid because this image is built FROM
+#     the same rlsys/miles base they were compiled on. If the base image changes,
+#     regenerate both tarballs from a warmed GPU run (one that reached rollouts):
+#       docker exec <c> sh -c 'cd /app/aiter/aiter/jit && tar czf - build/ *.so' \
+#         > docker/aiter_prebuilt_gfx942.tgz
+#       docker exec <c> sh -c 'cd /root && tar czf - .aiter' \
+#         > docker/aiter_prebuilt_home_gfx942.tgz
+COPY docker/aiter_prebuilt_gfx942.tgz /tmp/aiter_jit.tgz
+COPY docker/aiter_prebuilt_home_gfx942.tgz /tmp/aiter_home.tgz
+RUN tar xzf /tmp/aiter_jit.tgz -C /app/aiter/aiter/jit \
+    && tar xzf /tmp/aiter_home.tgz -C /root \
+    && rm /tmp/aiter_jit.tgz /tmp/aiter_home.tgz \
+    && ls /app/aiter/aiter/jit/*.so /root/.aiter/build/*/lib.so
+
+# --------------------------------------------------------------------------- #
+# 5. JupyterLab + the monitoring libs the notebook imports.
+# --------------------------------------------------------------------------- #
+RUN pip install --no-cache-dir \
+        jupyterlab \
+        plotly \
+        nbformat \
+        pandas
+
+# Workshop pod entrypoint: starts Harbor (background, proot), waits healthy, then
+# execs JupyterLab. The launcher invokes `start-workshop.sh <jupyter-lab-flags>`
+# so all the static orchestration (aiter-lock backstop, harbor launch, health
+# loop) lives here in the image rather than in a base64-encoded command string.
+COPY docker/start-workshop.sh /usr/local/bin/start-workshop.sh
+RUN chmod +x /usr/local/bin/start-workshop.sh
+
+# --------------------------------------------------------------------------- #
+# 6. Miles source + the workshop, then bake the CodeContests dataset.
+#    Installing miles needs its source present (the rlsys base does not bake it).
+#    Baking the dataset removes the §5 HF download from the workshop: the
+#    extracted task dirs and the difficulty-split jsonls ship in the image.
+# --------------------------------------------------------------------------- #
+ENV REPO_DIR=/workspace/miles_aai
+COPY . ${REPO_DIR}
+WORKDIR ${REPO_DIR}
+# Editable install only (no `import miles` here): importing miles_plugins.mbridge
+# pulls in the ROCm torch + megatron.core, which we must not require on a
+# CPU-only build host. The notebook (§3) imports miles at runtime in the GPU
+# container, matching Dockerfile.cc-base's deferred-install design.
+RUN pip install -e . --no-deps --no-build-isolation
+
+# Baked dataset location (overridable at runtime via HARBOR_TASKS_DIR / env).
+ENV CC_TASKS_DIR=/workspace/harbor_tasks_cc
+ENV EX=${REPO_DIR}/examples/experimental/qwen3-codecontests
+# extract_codecontests.py needs pyarrow + huggingface_hub (download path); the
+# rlsys base usually ships huggingface_hub but pyarrow is not guaranteed.
+RUN pip install --no-cache-dir pyarrow huggingface_hub
+RUN python3 "${EX}/data_prep/extract_codecontests.py" \
+        --dataset open-thoughts/CodeContests --out "${CC_TASKS_DIR}" \
+    && python3 "${EX}/data_prep/split_by_difficulty.py" \
+        --tasks "${CC_TASKS_DIR}" --out-dir "${EX}/data" \
+    && echo "baked tasks: $(ls "${CC_TASKS_DIR}" | wc -l)  jsonls: $(ls "${EX}"/data/cc_train_*.jsonl | wc -l)"
+
+# --------------------------------------------------------------------------- #
+# 7. Defaults: harbor on :11000, jupyter on :8888, subprocess env, loopback
+#    wiring. No docker socket, no swe-net.
+#
+# MILES_HOST_IP=127.0.0.1 is load-bearing: miles derives the SGLang router /
+# TITO session-server bind address AND the agent's OPENAI_API_BASE from
+# get_host_info(), which otherwise probes the LAN IP (the container eth0 IP, e.g.
+# 172.17.0.2). The agent runs in a proot sandbox and dials localhost; if the
+# servers bound the eth0 IP instead, every model call fails with a litellm
+# Connection error -> AgentError -> reward 0. Pinning loopback makes the servers
+# bind 127.0.0.1 and advertise 127.0.0.1 consistently, so agents reach the model.
+# --------------------------------------------------------------------------- #
+# MILES_CUDA_GRAPH_MAX_BS caps the largest CUDA-graph batch size SGLang captures
+# at startup. The workshop's peak rollout concurrency is rollout_batch_size(2) *
+# n_samples_per_prompt(8) = 16, but SGLang otherwise captures graphs up to bs=512
+# (~50 sizes, ~70s on MI300). Capping at 16 collapses capture to ~4s with no
+# throughput loss (no batch ever exceeds 16). Read in rollout_server.py.
+ENV HARBOR_ENV_TYPE=subprocess \
+    HARBOR_TASKS_DIR=${CC_TASKS_DIR} \
+    HARBOR_DELETE_CONTAINERS=true \
+    MSWEA_CONFIG_FILE=${REPO_DIR}/examples/experimental/qwen3-codecontests/harbor/codecontests.yaml \
+    AGENT_SERVER_URL=http://localhost:11000 \
+    MILES_HOST_IP=127.0.0.1 \
+    MILES_ROUTER_EXTERNAL_HOST=127.0.0.1 \
+    MILES_CUDA_GRAPH_MAX_BS=16
+
+EXPOSE 8888 11000
+CMD ["sleep", "infinity"]

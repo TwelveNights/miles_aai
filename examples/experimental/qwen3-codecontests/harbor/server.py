@@ -245,17 +245,37 @@ async def _run_trial(request: RunRequest) -> dict[str, Any]:
                 "MSWEA_COST_TRACKING": "ignore_errors",
             }
 
+        # Environment backend. Defaults to "subprocess": Harbor runs each task on
+        # the bare host inside a proot sandbox (no Docker, no per-task
+        # containers), which is what the single-image workshop uses. Set
+        # HARBOR_ENV_TYPE=docker to restore the legacy Docker-in-Docker path.
+        env_type = os.getenv("HARBOR_ENV_TYPE", "subprocess").strip().lower()
         env_config_kwargs: dict[str, Any] = {
-            "type": "docker",
+            "type": env_type,
             "delete": os.getenv("HARBOR_DELETE_CONTAINERS", "false").lower() in ("true", "1", "t"),
         }
-        # Optional: extra docker-compose override(s) so Harbor task containers
-        # join swe-net (and can reach the Miles router/session server).
-        extra_compose_env = os.getenv("HARBOR_EXTRA_DOCKER_COMPOSE")
-        if extra_compose_env:
-            extra_compose = [Path(p) for p in extra_compose_env.split(os.pathsep) if p]
-            if extra_compose:
-                env_config_kwargs["extra_docker_compose"] = extra_compose
+        if env_type == "subprocess":
+            # CodeContests tasks ship an environment/Dockerfile (ignored on the
+            # bare host) and the agent writes /app/solution.py in one exec that a
+            # separate verifier exec grades, so /app must persist across execs.
+            # The subprocess env sandboxes via proot (userspace, ptrace-based), so
+            # the workshop runs in a fully NON-privileged Kubernetes pod under the
+            # RuntimeDefault seccomp profile.
+            env_config_kwargs["kwargs"] = {
+                "ignore_build": True,
+                "persist_roots": ["/app"],
+            }
+        else:
+            # Docker path only: extra docker-compose override(s) so task
+            # containers join swe-net (and can reach the Miles router/session
+            # server). Not applicable to the subprocess backend.
+            extra_compose_env = os.getenv("HARBOR_EXTRA_DOCKER_COMPOSE")
+            if extra_compose_env:
+                extra_compose = [
+                    Path(p) for p in extra_compose_env.split(os.pathsep) if p
+                ]
+                if extra_compose:
+                    env_config_kwargs["extra_docker_compose"] = extra_compose
 
         config = TrialConfig(
             task=TaskConfig(path=task_path),
