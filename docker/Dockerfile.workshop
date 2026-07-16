@@ -8,6 +8,11 @@
 #
 # Build context = repo root (it COPYs miles source + the workshop dir):
 #   docker build -f docker/Dockerfile.workshop -t miles_workshop:v1 .
+# Behind a MITM TLS-intercepting proxy (e.g. AMD's Zscaler), trust the host CA
+# bundle during the build by passing it as a secret:
+#   docker build -f docker/Dockerfile.workshop \
+#     --secret id=ca,src=/etc/ssl/certs/ca-certificates.crt \
+#     -t miles_workshop:v1 .
 # Run (GPU host):
 #   bash docker/run_workshop.sh
 #
@@ -18,6 +23,21 @@ FROM rlsys/miles:rocm7-MI300-sglang0.5.9-latest
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1
+
+# Trust the host's CA bundle for the rest of this build, if one is supplied as a
+# build secret (e.g. behind AMD's Zscaler TLS-interception proxy):
+#   docker build --secret id=ca,src=/etc/ssl/certs/ca-certificates.crt ...
+# `required=false` makes this a no-op when no secret is passed, so this single
+# Dockerfile serves both the plain and behind-MITM-proxy builds identically.
+RUN --mount=type=secret,id=ca,required=false \
+    if [ -s /run/secrets/ca ]; then \
+        cp /run/secrets/ca /usr/local/share/ca-certificates/build-proxy.crt \
+        && update-ca-certificates; \
+    fi
+ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    UV_NATIVE_TLS=1
 
 # --------------------------------------------------------------------------- #
 # 1. SGLang TITO patches (identical to Dockerfile.cc-base).
@@ -62,7 +82,11 @@ RUN pip install --no-cache-dir \
 #    `pytest --ctrf` grading path resolves immediately on the default python.
 #    The ctrf plugin's import module is `ctrf` (entry point "ctrf").
 # --------------------------------------------------------------------------- #
-RUN apt-get update \
+# apt-get update tolerates failure here: some build hosts carry a stale internal
+# AMD artifactory apt source (rocm-osdb-22.04-deb) that 404s and would otherwise
+# abort the whole update; the packages below all come from Ubuntu's own
+# archives, which fetch fine.
+RUN (apt-get update || true) \
     && apt-get install -y --no-install-recommends \
         proot \
         curl \
@@ -106,9 +130,11 @@ RUN pip install --no-cache-dir \
 #    harbor server runs with that interpreter (HARBOR_PYTHON) while training
 #    keeps using the base python3. The two roles are separate processes that
 #    only talk over HTTP (localhost:11000), so they never share a Python.
-#    Pulled from the fork branch until the subprocess env lands upstream.
+#    Pulled from the fork, pinned to an immutable commit (NOT a branch): the
+#    install RUN layer is cached by command string, so a moving branch ref would
+#    silently reuse a stale harbor build on rebuild. Bump this SHA to pull fixes.
 # --------------------------------------------------------------------------- #
-ARG HARBOR_REF=git+https://github.com/TwelveNights/harbor.git@feat/subprocess-environment
+ARG HARBOR_REF=git+https://github.com/TwelveNights/harbor.git@134122d08117c4da1ebd8e4dcad3d3dc41b07c64
 ENV HARBOR_VENV=/opt/harbor-venv
 ENV HARBOR_PYTHON=${HARBOR_VENV}/bin/python
 RUN uv python install 3.12 \
@@ -157,7 +183,9 @@ RUN pip install --no-cache-dir \
         jupyterlab \
         plotly \
         nbformat \
-        pandas
+        pandas \
+        ipywidgets \
+        anywidget
 
 # Workshop pod entrypoint: starts Harbor (background, proot), waits healthy, then
 # execs JupyterLab. The launcher invokes `start-workshop.sh <jupyter-lab-flags>`

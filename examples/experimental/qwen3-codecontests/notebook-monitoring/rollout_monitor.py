@@ -14,7 +14,6 @@ import glob
 import json
 import os
 import re
-import subprocess
 import time
 from datetime import datetime, timezone
 
@@ -29,12 +28,62 @@ def default_work_dir(work_dir=None):
             or os.path.join(os.environ.get("EX", os.getcwd()), "runtime", "work"))
 
 
-def _tail(p, n):
-    return subprocess.run(["tail", "-n", str(n), p], capture_output=True, text=True).stdout if os.path.exists(p) else ""
+def _tail(p, n):  # last n lines, read natively from the end (no subprocess spawn)
+    if not os.path.exists(p) or n <= 0:
+        return ""
+    with open(p, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        end = f.tell()
+        block, data, nl = 8192, b"", 0
+        pos = end
+        while pos > 0 and nl <= n:
+            step = min(block, pos)
+            pos -= step
+            f.seek(pos)
+            chunk = f.read(step)
+            nl += chunk.count(b"\n")
+            data = chunk + data
+    text = data.decode("utf-8", "ignore")
+    lines = text.splitlines(keepends=True)
+    return "".join(lines[-n:])
 
 
-def _head(p, n):
-    return subprocess.run(["head", "-n", str(n), p], capture_output=True, text=True).stdout if os.path.exists(p) else ""
+def _head(p, n):  # first n lines, read natively (no subprocess spawn)
+    if not os.path.exists(p):
+        return ""
+    out = []
+    with open(p, errors="ignore") as f:
+        for _ in range(n):
+            ln = f.readline()
+            if not ln:
+                break
+            out.append(ln)
+    return "".join(out)
+
+
+def _read_new(path, state):
+    """Read only bytes appended to ``path`` since the last call.
+
+    ``state`` is a mutable dict of {path: byte_offset}; returns the list of
+    complete new lines (a half-written trailing line is left for the next call).
+    Resets to offset 0 if the file shrank (a fresh run truncated it).
+    """
+    if not os.path.exists(path):
+        return []
+    size = os.path.getsize(path)
+    off = state.get(path, 0)
+    if size < off:  # truncated -> new run
+        off = 0
+    if size == off:
+        return []
+    with open(path, "rb") as f:
+        f.seek(off)
+        data = f.read(size - off)
+    last_nl = data.rfind(b"\n")
+    if last_nl == -1:  # no complete line yet; wait for more
+        return []
+    state[path] = off + last_nl + 1
+    return data[: last_nl + 1].decode("utf-8", "ignore").splitlines()
 
 
 def _short(s, n=120):
@@ -62,7 +111,29 @@ def run_start(log):  # first timestamp in this run's (truncated) log
     return m.group(1) if m else None
 
 
-def harbor_status(harbor_log, since):  # only lines with timestamp >= since (this run)
+def harbor_status(harbor_log, since, state=None):
+    """Map instance -> (status, reward) for this run (lines with timestamp >= since).
+
+    When ``state`` (a dict) is passed, reads only bytes appended since the last
+    call and accumulates results in ``state['st']`` across polls; the offset is
+    tracked in ``state`` keyed by path. Without ``state`` it re-reads the whole
+    file (original behavior, used by watch_rollout).
+    """
+    if state is not None:
+        if os.path.exists(harbor_log) and os.path.getsize(harbor_log) < state.get(harbor_log, 0):
+            state["st"] = {}  # log truncated (new run) -> drop stale instance entries
+        st = state.setdefault("st", {})
+        for ln in _read_new(harbor_log, state):
+            m = TS.match(ln)
+            if since and (not m or m.group(1) < since):
+                continue
+            r = re.search(r"Running instance: (\S+)", ln)
+            if r:
+                st.setdefault(r.group(1), ("running", None))
+            f = re.search(r"Instance (\S+) finished: exit_status=(\w+), reward=([0-9.]+)", ln)
+            if f:
+                st[f.group(1)] = (f.group(2), float(f.group(3)))
+        return st
     st = {}
     if os.path.exists(harbor_log):
         for ln in open(harbor_log):
@@ -78,8 +149,23 @@ def harbor_status(harbor_log, since):  # only lines with timestamp >= since (thi
     return st
 
 
-def trial_info(d):
+def _trial_mtime(d):
+    # newest mtime across the files trial_info actually reads. Dir mtime alone is
+    # unreliable: it does NOT change when an existing trajectory.json is rewritten
+    # in place, so key the cache on file content mtimes instead.
+    paths = [f"{d}/verifier/reward.txt", f"{d}/agent/mini-swe-agent.trajectory.json",
+             f"{d}/agent/trajectory.json"]
+    return max((os.path.getmtime(p) for p in paths if os.path.exists(p)), default=os.path.getmtime(d))
+
+
+def trial_info(d, cache=None):
     # per-SAMPLE truth: (turns, last_real_cmd, its_result, exit_status, reward)
+    # cache: optional {dir: (mtime, result)} -> reparse only when a read file changes.
+    mt = _trial_mtime(d) if cache is not None else None
+    if cache is not None:
+        hit = cache.get(d)
+        if hit and hit[0] == mt:
+            return hit[1]
     turns = None
     cmd = res = ""
     exit_status = "running"
@@ -112,28 +198,34 @@ def trial_info(d):
                     if i + 1 < len(msgs) and msgs[i + 1].get("role") == "tool":
                         res = _short(msgs[i + 1].get("content"))
         break
-    return turns, cmd, res, exit_status, reward
+    result = (turns, cmd, res, exit_status, reward)
+    if cache is not None:
+        cache[d] = (mt, result)
+    return result
 
 
-def rollout_panel(log, trials_dir, harbor_log, maxrows=8, scope_ep=None, title="this run", include_tail=True):
+def rollout_panel(log, trials_dir, harbor_log, maxrows=8, scope_ep=None, title="this run", include_tail=True,
+                  trial_cache=None, harbor_state=None):
     """Per-sample rollout view. Returns (lines, done, reason).
 
     scope_ep:     only count trial dirs modified at/after this epoch (defaults to the run start).
                   The training monitor passes the last finished step's time to scope to the CURRENT step.
     title:        header label, e.g. "this run" or "step 1 rollout".
     include_tail: prepend this log's tail (the training monitor prints its own tail, so it skips this).
+    trial_cache:  optional {dir: (mtime, info)} reused across polls so unchanged trials aren't re-parsed.
+    harbor_state: optional dict enabling incremental harbor.log reads across polls.
     """
     since = run_start(log)
     run_ep = datetime.strptime(since, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp() if since else 0
     if scope_ep is None:
         scope_ep = run_ep
-    hs = harbor_status(harbor_log, since)
+    hs = harbor_status(harbor_log, since, state=harbor_state)
     names = set(hs)
     nrun_h = sum(v[0] == "running" for v in hs.values())  # trials in flight (per harbor)
     cand = [d for d in glob.glob(f"{trials_dir}/code_contests-*__*") if os.path.basename(d).split("__")[0] in names]
     cand.sort(key=os.path.getmtime, reverse=True)
     trials = [d for d in cand if os.path.getmtime(d) >= scope_ep - 5]  # scoped (no fallback -> no leakage)
-    infos = [(os.path.basename(d).split("__")[0], *trial_info(d)) for d in trials]
+    infos = [(os.path.basename(d).split("__")[0], *trial_info(d, cache=trial_cache)) for d in trials]
     nprob = len({n for n, *_ in infos})
     npass = sum((r or 0) > 0 for *_, r in infos)
 
