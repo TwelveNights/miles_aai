@@ -75,6 +75,10 @@ def parse_steps(tlog):
                 mm = re.search(rf"'perf/{key}': ([0-9.eE+-]+)", ln)
                 if mm:
                     d[key] = float(mm.group(1))
+            # avg turns per rollout (mean over the step's samples), logged as agent/turns_mean
+            mm = re.search(r"'agent/turns_mean': ([0-9.eE+-]+)", ln)
+            if mm:
+                d["turns_mean"] = float(mm.group(1))
         m = re.search(r"step (\d+): \{.*'train/step'", ln)
         if m:
             d = s.setdefault(int(m.group(1)), {})
@@ -91,25 +95,30 @@ def render_charts(s):
     roll_t = [s[n].get("rollout_time") for n in xs]
     reward = [s[n].get("raw_reward") for n in xs]
     trunc = [s[n].get("truncated") for n in xs]
+    turns = [s[n].get("turns_mean") for n in xs]  # agent/turns_mean: avg agent turns per rollout sample
 
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                        subplot_titles=("step_time vs rollout_time (s)", "rollout/raw_reward", "rollout/truncated"))
+    fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
+                        subplot_titles=("step_time vs rollout_time (s)", "rollout/raw_reward",
+                                        "rollout/truncated", "agent/turns_mean (avg turns per rollout)"))
     fig.add_trace(go.Scatter(x=xs, y=step_t, name="step_time", mode="lines+markers"), 1, 1)
     fig.add_trace(go.Scatter(x=xs, y=roll_t, name="rollout_time", mode="lines+markers"), 1, 1)
     fig.add_trace(go.Scatter(x=xs, y=reward, name="raw_reward", mode="lines+markers"), 2, 1)
     fig.add_trace(go.Scatter(x=xs, y=trunc, name="truncated", mode="lines+markers"), 3, 1)
+    fig.add_trace(go.Scatter(x=xs, y=turns, name="turns_mean", mode="lines+markers"), 4, 1)
     fig.update_yaxes(title_text="seconds", row=1, col=1)
     fig.update_yaxes(title_text="raw_reward (pass rate)", row=2, col=1)
     fig.update_yaxes(title_text="truncated fraction", row=3, col=1)
-    fig.update_xaxes(title_text="training step", row=3, col=1)
-    fig.update_layout(height=820, hovermode="x unified", margin=dict(l=70, r=20, t=40, b=45))
+    fig.update_yaxes(title_text="avg turns / rollout", row=4, col=1)
+    fig.update_xaxes(title_text="rollout / training step", row=4, col=1)
+    fig.update_layout(height=1040, hovermode="x unified", margin=dict(l=70, r=20, t=40, b=45))
     display(fig)
-    print(f"{'step':>4} {'step_t':>7} {'roll_t':>7} {'reward':>7} {'trunc':>6}")
+    print(f"{'step':>4} {'step_t':>7} {'roll_t':>7} {'reward':>7} {'trunc':>6} {'turns':>6}")
     for i, n in enumerate(xs):
         print(f"{n:>4} {(('%.0f' % step_t[i]) if step_t[i] is not None else '-'):>7} "
               f"{(('%.0f' % roll_t[i]) if roll_t[i] is not None else '-'):>7} "
               f"{(('%.3f' % reward[i]) if reward[i] is not None else '-'):>7} "
-              f"{(('%.3f' % trunc[i]) if trunc[i] is not None else '-'):>6}")
+              f"{(('%.3f' % trunc[i]) if trunc[i] is not None else '-'):>6} "
+              f"{(('%.2f' % turns[i]) if turns[i] is not None else '-'):>6}")
     print("step_t = perf/step_time reported by the trainer for each step (its own measurement, "
           "including step 0); not wall-clock timed by this monitor.")
 
