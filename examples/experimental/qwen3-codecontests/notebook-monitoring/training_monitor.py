@@ -10,6 +10,8 @@ truncated) once the first training step completes. Interrupt/stop to end.
 """
 from __future__ import annotations
 
+import bisect
+import glob
 import os
 import re
 import subprocess
@@ -111,10 +113,6 @@ def _parse_line(ln, s):
             mm = re.search(rf"'perf/{key}': ([0-9.eE+-]+)", ln)
             if mm:
                 d[key] = float(mm.group(1))
-        # avg turns per rollout (mean over the step's samples), logged as agent/turns_mean
-        mm = re.search(r"'agent/turns_mean': ([0-9.eE+-]+)", ln)
-        if mm:
-            d["turns_mean"] = float(mm.group(1))
     m = re.search(r"step (\d+): \{.*'train/step'", ln)
     if m:
         d = s.setdefault(int(m.group(1)), {})
@@ -145,6 +143,44 @@ def parse_steps(tlog, state=None):
     return s
 
 
+def fill_turns_by_step(trials_dir, s, tlog=None, cache=None):
+    """Set s[step]['turns_mean'] to the avg agent turns per rollout, from trajectories.
+
+    The trainer's own agent/turns_mean is 0 for the Harbor mini-swe-agent, so we
+    instead count assistant turns per sample (rollout_monitor.trial_info) and bucket
+    each trial into the step whose rollout produced it: a trial belongs to the first
+    completed step whose 'train/step' timestamp is at/after the trial's mtime (rollout
+    runs before that step trains). Trials older than this run's start are ignored so
+    stale cc_trials/ dirs from previous runs don't leak into step 0. ``cache`` is the
+    same per-dir cache rollout_panel uses, so unchanged trials aren't re-parsed.
+    """
+    done = sorted(n for n in s if "ts" in s[n])  # completed step numbers, in order
+    if not done:
+        return
+    bounds = [s[n]["ts"] for n in done]  # step done[i] finished at bounds[i]
+    run_ep = 0.0  # lower-bound: this run's start (first timestamp in train.log)
+    since = rollout_monitor.run_start(tlog) if tlog else None
+    if since:
+        run_ep = datetime.strptime(since, "%Y-%m-%d %H:%M:%S").timestamp()
+    acc = {n: [] for n in done}
+    for d in glob.glob(f"{trials_dir}/code_contests-*__*"):
+        try:
+            mt = rollout_monitor._trial_mtime(d)
+        except OSError:
+            continue
+        if mt < run_ep - 5:
+            continue  # trial from an earlier run
+        i = bisect.bisect_left(bounds, mt - 5)  # first step finishing at/after this trial (5s slack)
+        if i >= len(done):
+            continue  # produced after the last completed step -> current in-flight rollout
+        turns = rollout_monitor.trial_info(d, cache=cache)[0]
+        if turns is not None:
+            acc[done[i]].append(turns)
+    for n, vals in acc.items():
+        if vals:
+            s[n]["turns_mean"] = sum(vals) / len(vals)
+
+
 def _chart_arrays(s):  # (xs, step_t, roll_t, reward, trunc, turns) aligned by step
     xs = sorted(s)
     return (xs,
@@ -152,14 +188,14 @@ def _chart_arrays(s):  # (xs, step_t, roll_t, reward, trunc, turns) aligned by s
             [s[n].get("rollout_time") for n in xs],
             [s[n].get("raw_reward") for n in xs],
             [s[n].get("truncated") for n in xs],
-            [s[n].get("turns_mean") for n in xs])  # agent/turns_mean: avg agent turns per rollout sample
+            [s[n].get("turns_mean") for n in xs])  # avg agent turns/step (set by fill_turns_by_step)
 
 
 def _new_figure(go, make_subplots, widget=False):
     """4-subplot figure with 5 empty traces. widget=True -> mutable go.FigureWidget."""
     fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
                         subplot_titles=("step_time vs rollout_time (s)", "rollout/raw_reward",
-                                        "rollout/truncated", "agent/turns_mean (avg turns per rollout)"))
+                                        "rollout/truncated", "avg agent turns per rollout (from trajectories)"))
     fig.add_trace(go.Scatter(x=[], y=[], name="step_time", mode="lines+markers"), 1, 1)
     fig.add_trace(go.Scatter(x=[], y=[], name="rollout_time", mode="lines+markers"), 1, 1)
     fig.add_trace(go.Scatter(x=[], y=[], name="raw_reward", mode="lines+markers"), 2, 1)
@@ -274,6 +310,7 @@ def watch_training(work_dir=None, poll=8, raw=True, tail_lines=5):
     try:
         while True:
             s = parse_steps(tlog, state=pstate)
+            fill_turns_by_step(trials, s, tlog, cache=trial_cache)  # avg turns/step from trajectories
             step_ts = sorted(v["ts"] for v in s.values() if "ts" in v)
             n_done = len(step_ts)  # completed training steps
             cur_step = n_done  # the rollout step currently in progress
