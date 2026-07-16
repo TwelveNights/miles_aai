@@ -1,0 +1,47 @@
+# Prebuilt CodeContests task-sandbox base image.
+#
+# The stock task sandbox is bare `ubuntu:24.04`, so Harbor's installed-agent
+# adapter installs the agent INSIDE every task container at trial time via
+# `uv tool install mini-swe-agent --with 'litellm[proxy]'`. That means every
+# rollout sample pays a fresh PyPI download (~30-60s) and, if the litellm proxy
+# extra is missing, dies with `ModuleNotFoundError: No module named 'fastapi'`
+# (recorded as AgentError).
+#
+# This image bakes uv + mini-swe-agent (with the litellm[proxy] extra) into the
+# same locations the adapter uses at runtime (/root/.local), so the runtime
+# `uv tool install ...` finds the tool already satisfied -> fast no-op, no
+# download, and the fastapi/orjson proxy deps are guaranteed present.
+#
+# Build:
+#   docker build -f docker/Dockerfile.cc-task-base docker/ -t cc_task_base:v1
+#
+# Use (so task Dockerfiles inherit it): set the env var before data prep (§5),
+# which makes extract_codecontests.py rewrite each task's `environment/Dockerfile`
+# FROM line:
+#   export CC_TASK_BASE_IMAGE=cc_task_base:v1
+#
+# Keep the pins in sync with docker/Dockerfile.agent-base and the MSWEA_VERSION
+# default in harbor/server.py (mini-swe-agent==2.3.0, uv 0.7.13).
+FROM ubuntu:24.04
+
+WORKDIR /app
+RUN mkdir -p /output && chmod 777 /output
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 python3-pip curl ca-certificates git build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv to /root/.local (containers run as root; the adapter sources
+# "$HOME/.local/bin/env"), pinned to the version the adapter installs.
+RUN curl -LsSf https://astral.sh/uv/0.7.13/install.sh | sh
+
+# Bake the agent as a uv tool with the litellm[proxy] extra, then verify the
+# previously-failing proxy import chain resolves (fastapi + orjson present).
+RUN . "$HOME/.local/bin/env" \
+    && uv tool install mini-swe-agent==2.3.0 --with 'litellm[proxy]' \
+    && "$HOME/.local/share/uv/tools/mini-swe-agent/bin/python" -c \
+        "import fastapi, orjson, litellm.responses.mcp.litellm_proxy_mcp_handler; print('agent litellm[proxy] ok')"
+
+ENV PATH="/root/.local/bin:${PATH}"

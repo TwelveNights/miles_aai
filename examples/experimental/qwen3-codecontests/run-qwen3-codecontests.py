@@ -61,6 +61,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     global_batch_size: int = 128
     num_rollout: int = 64
     over_sampling_batch_size: int = 0
+    # Per-response generation cap (tokens). 0 = mode default (8192 sync / 16384 async).
+    rollout_max_response_len: int = 0
     save_interval: int = 10
 
     # Async (disaggregated) mode: 4 train + 4 rollout GPUs via train_async.py.
@@ -107,6 +109,7 @@ def _to_ccargs(args: ScriptArgs) -> "LA.CCArgs":
         global_batch_size=args.global_batch_size,
         num_rollout=args.num_rollout,
         over_sampling_batch_size=args.over_sampling_batch_size,
+        rollout_max_response_len=args.rollout_max_response_len,
         wandb_key=args.wandb_key,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,

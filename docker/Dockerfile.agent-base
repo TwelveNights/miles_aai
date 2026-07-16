@@ -33,9 +33,14 @@ RUN mkdir -p /usr/local/lib/docker/cli-plugins \
     && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose \
     && docker compose version
 
-# Harbor orchestrator + the mini-swe-agent runner (versions match agent_env_patched:d1).
+# Harbor orchestrator + the mini-swe-agent runner. Harbor is pinned to an
+# immutable fork commit that carries the `uv tool install ... --with
+# 'litellm[proxy]'` fix (fastapi/orjson), so the adapter's per-trial agent
+# install no longer crashes with ModuleNotFoundError: fastapi -> AgentError.
+# Pin (not a branch ref) so the pip layer cache busts on the fix and builds stay
+# reproducible. Keep in sync with docker/Dockerfile.workshop's HARBOR_REF.
 RUN pip install --no-cache-dir \
-        harbor==0.13.1 \
+        "harbor @ git+https://github.com/TwelveNights/harbor.git@134122d0" \
         mini-swe-agent==2.3.0
 
 WORKDIR /root

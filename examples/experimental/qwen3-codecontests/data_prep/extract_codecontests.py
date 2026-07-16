@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import re
 import tarfile
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path, PurePosixPath
@@ -70,6 +71,32 @@ def _safe_extract_tar(archive_bytes: bytes, dest_dir: Path) -> None:
                     dst.write(src.read())
 
 
+def _rewrite_base_image(target: Path) -> None:
+    """Optionally rewrite the task's ``environment/Dockerfile`` FROM line.
+
+    When ``CC_TASK_BASE_IMAGE`` is set (e.g. ``cc_task_base:v1``), point each
+    task container at a prebuilt base that already has uv + mini-swe-agent
+    (with the ``litellm[proxy]`` extra) installed. This turns Harbor's per-trial
+    ``uv tool install`` into a fast no-op and guarantees the fastapi/orjson proxy
+    deps are present (no ``ModuleNotFoundError`` -> AgentError). No-op when the
+    env var is unset, so default behavior (``FROM ubuntu:24.04``) is unchanged.
+    Idempotent, and applied to already-extracted tasks on re-run.
+    """
+    base = os.environ.get("CC_TASK_BASE_IMAGE")
+    if not base:
+        return
+    dockerfile = target / "environment" / "Dockerfile"
+    if not dockerfile.exists():
+        return
+    try:
+        text = dockerfile.read_text()
+        new = re.sub(r"^FROM\s+\S+", f"FROM {base}", text, count=1, flags=re.MULTILINE)
+        if new != text:
+            dockerfile.write_text(new)
+    except Exception as e:  # noqa: BLE001
+        print(f"  WARN failed to rewrite base image for {target.name}: {e}")
+
+
 def _extract_one(args: tuple) -> bool:
     rel_path, data, out_dir_str = args
     if not isinstance(rel_path, str) or not isinstance(data, (bytes, bytearray, memoryview)):
@@ -80,9 +107,11 @@ def _extract_one(args: tuple) -> bool:
     if not _is_within(out_dir, target):
         return False
     if target.exists() and (target / "instruction.md").exists():
+        _rewrite_base_image(target)  # patch base image even if already extracted
         return True  # idempotent: already extracted
     try:
         _safe_extract_tar(bytes(data), target)
+        _rewrite_base_image(target)
         return True
     except Exception as e:  # noqa: BLE001
         print(f"  WARN failed to extract {rel_path}: {e}")

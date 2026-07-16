@@ -44,6 +44,9 @@ class CCArgs:
     global_batch_size: int = 8
     num_rollout: int = 3000
     over_sampling_batch_size: int = 0
+    # Per-response generation cap (tokens). 0 = use the mode default
+    # (8192 sync / 16384 async); >0 overrides it.
+    rollout_max_response_len: int = 0
 
     # qwen3 / codecontests fixed knobs
     tito_model: str = "qwen3"
@@ -64,7 +67,7 @@ def build_train_args(a: CCArgs) -> str:
     async_mode = a.async_mode
 
     roll_temp = 0.7 if async_mode else 0.8
-    roll_max_resp = 16384 if async_mode else 8192
+    roll_max_resp = 16384 if async_mode else (a.rollout_max_response_len or 8192)
     seq_len = 65536 if async_mode else a.max_seq_len
     roll_ctx = 65536 if async_mode else a.max_seq_len
     max_tok_per_gpu = 32768 if async_mode else 16384
@@ -152,11 +155,11 @@ def build_train_args(a: CCArgs) -> str:
         f"--sglang-reasoning-parser {a.reasoning_parser} "
         "--use-miles-router "
         "--sglang-router-port 31000 "
+        f"--sglang-context-length {roll_ctx} "
+        "--sglang-allow-auto-truncate "
     )
     if async_mode:
         sglang_args += "--sglang-disable-custom-all-reduce "
-        sglang_args += f"--sglang-context-length {roll_ctx} "
-        sglang_args += "--sglang-allow-auto-truncate "
 
     agent_args = (
         "--custom-generate-function-path miles.rollout.generate_hub.agentic_tool_call.generate "

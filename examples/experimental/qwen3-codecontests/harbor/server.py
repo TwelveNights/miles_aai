@@ -228,6 +228,15 @@ async def _run_trial(request: RunRequest) -> dict[str, Any]:
         if config_file:
             agent_kwargs["config_file"] = config_file
 
+        # Pin the mini-swe-agent version the Harbor adapter installs via
+        # `uv tool install` into the environment. Unpinned it grabs latest, whose
+        # newer litellm import chain requires fastapi that the task sandbox lacks
+        # (ModuleNotFoundError: fastapi -> AgentError). 2.3.0 matches the stack
+        # baked into agent_base. Override via MSWEA_VERSION ("" to allow latest).
+        mswea_version = os.getenv("MSWEA_VERSION", "2.3.0")
+        if mswea_version:
+            agent_kwargs["version"] = mswea_version
+
         if is_host_agent:
             agent_kwargs["api_base"] = request.base_url
             agent_kwargs["api_key"] = request.api_key or "dummy"
@@ -243,6 +252,7 @@ async def _run_trial(request: RunRequest) -> dict[str, Any]:
                 "HOSTED_VLLM_API_BASE": request.base_url,
                 "HOSTED_VLLM_API_KEY": request.api_key,
                 "MSWEA_COST_TRACKING": "ignore_errors",
+                "MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT": os.getenv("MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT", "3")
             }
 
         # Environment backend. Defaults to "subprocess": Harbor runs each task on

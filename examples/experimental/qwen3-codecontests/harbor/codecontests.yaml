@@ -119,7 +119,7 @@ agent:
     {{system}} {{release}} {{version}} {{machine}}
     </system_information>
   # Contest problems need far fewer steps than SWE-bench repos; generous but bounded.
-  step_limit: 100
+  step_limit: 20
   cost_limit: 0.
 
 environment:
